@@ -1,0 +1,251 @@
+import os
+import numpy as np
+import argparse
+from datetime import datetime
+import logging
+
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.autograd import Variable
+from torch.nn.modules.loss import CrossEntropyLoss
+
+import matplotlib.pyplot as plt
+
+from utils.dataloader import get_loader, test_dataset
+from utils.utils import clip_gradient, adjust_lr, AvgMeter
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4"
+
+import random
+def seed_torch(seed=1000):
+    print("seed: "+str(seed))
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def mean_dice_np(y_true, y_pred, **kwargs):
+    """
+    compute mean dice for binary segmentation map via numpy
+    """
+    axes = (0, 1)  # W,H axes of each image
+    intersection = np.sum(np.abs(y_pred * y_true), axis=axes)
+    mask_sum = np.sum(np.abs(y_true), axis=axes) + np.sum(np.abs(y_pred), axis=axes)
+
+    smooth = .001
+    dice = 2 * (intersection + smooth) / (mask_sum + smooth)
+    return dice
+
+def structure_loss(pred, mask):
+    weit = 1 + 5 * torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask)
+    wbce = F.binary_cross_entropy_with_logits(pred, mask, reduce='none')
+    wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
+
+    pred = torch.sigmoid(pred)
+    inter = ((pred * mask) * weit).sum(dim=(2, 3))
+    union = ((pred + mask) * weit).sum(dim=(2, 3))
+    wiou = 1 - (inter + 1) / (union - inter + 1)
+
+    return (wbce + wiou).mean()
+
+
+def test(model, path, dataset, model_name = 'PVT-CASCADE'):
+
+    data_path = os.path.join(path, dataset)
+    image_root = '{}/images/'.format(data_path)
+    gt_root = '{}/masks/'.format(data_path)
+    model.eval()
+    num1 = len(os.listdir(gt_root))
+    test_loader = test_dataset(image_root, gt_root, opt.img_size)
+    DSC = 0.0
+    for i in range(num1):
+        image, gt, name = test_loader.load_data()
+        gt = np.asarray(gt, np.float32)
+        gt /= (gt.max() + 1e-8)
+        image = image.cuda()
+
+        [res1, res2, res3, res4] = model(image)[0]
+        res = F.upsample(res1 + res2 + res3 + res4, size=gt.shape, mode='bilinear', align_corners=False)
+
+        res = res.sigmoid().data.cpu().numpy().squeeze() # apply sigmoid aggregation for binary segmentation
+        res = (res - res.min()) / (res.max() - res.min() + 1e-8)
+
+        # eval Dice
+        input = res
+        target = np.array(gt)
+
+        mean_dice = mean_dice_np(target, input)
+        DSC = DSC + mean_dice
+
+    return DSC / num1, num1
+
+def train(train_loader, model, optimizer, epoch, test_path, model_name = 'PVT-CASCADE'):
+    model.train()
+    global best
+    # size_rates = [0.75, 1, 1.25]
+    loss_record = AvgMeter()
+    for i, pack in enumerate(train_loader):
+        # for rate in size_rates:
+        optimizer.zero_grad()
+      
+        images, gts, egs = pack
+        images = images.cuda()
+        gts = gts.cuda()
+        egs = egs.cuda()
+
+        [d0, d1, d2, d3], cam_edge = model(images)
+        loss_edge = loss_func(cam_edge, egs)
+        loss0 = structure_loss(d0, gts)
+        loss1 = structure_loss(d1, gts)
+        loss2 = structure_loss(d2, gts)
+        loss3 = structure_loss(d3, gts)
+        loss = loss_edge + loss0 + loss1 + loss2 + loss3
+
+        # ---- backward ----
+        loss.backward()
+        clip_gradient(optimizer, opt.clip)
+        optimizer.step()
+        # ---- recording loss ----
+        # if rate == 1:
+        loss_record.update(loss.data, opt.batchsize)
+
+        # ---- train visualization ----
+        if i % 20 == 0 or i == total_step:
+            print('{} Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], '
+                  ' loss: {:0.4f}]'.
+                  format(datetime.now(), epoch, opt.epoch, i, total_step,
+                         loss_record.show()))
+    # save model
+    save_path = (train_save)
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    torch.save(model.state_dict(), save_path + '' + model_name + '-last.pth')
+    # choose the best model
+
+    global dict_plot
+   
+    if (epoch + 1) % 1 == 0:
+        total_dice = 0
+        total_images = 0
+        for dataset in ['CVC-300', 'CVC-ClinicDB', 'Kvasir', 'CVC-ColonDB', 'ETIS-LaribPolypDB']:
+            dataset_dice, n_images = test(model, test_path, dataset, model_name)
+            total_dice += (n_images*dataset_dice)
+            total_images += n_images
+            logging.info('epoch: {}, dataset: {}, dice: {}'.format(epoch, dataset, dataset_dice))
+            print(dataset, ': ', dataset_dice)
+            dict_plot[dataset].append(dataset_dice)
+        meandice = total_dice/total_images
+        dict_plot['test'].append(meandice)
+        print('Validation dice score: {}'.format(meandice))
+        logging.info('Validation dice score: {}'.format(meandice))
+        if epoch > 50:
+            if meandice > best:
+                print('##################### Dice score improved from {} to {}'.format(best, meandice))
+                logging.info('##################### Dice score improved from {} to {}'.format(best, meandice))
+                best = meandice
+                torch.save(model.state_dict(), save_path + '' + model_name + '-best.pth')
+                # torch.save(model.state_dict(), save_path +str(epoch)+ '' + model_name + '-best.pth')
+        else:
+            if meandice > best:
+                print('##################### Dice score improved from {} to {}'.format(best, meandice))
+                logging.info('##################### Dice score improved from {} to {}'.format(best, meandice))
+                best = meandice
+                torch.save(model.state_dict(), save_path + '' + model_name + '.pth')
+                # torch.save(model.state_dict(), save_path +str(epoch)+ '' + model_name + '-best.pth')
+
+if __name__ == '__main__':
+    dict_plot = {'CVC-300':[], 'CVC-ClinicDB':[], 'Kvasir':[], 'CVC-ColonDB':[], 'ETIS-LaribPolypDB':[], 'test':[]}
+    name = ['CVC-300', 'CVC-ClinicDB', 'Kvasir', 'CVC-ColonDB', 'ETIS-LaribPolypDB', 'test']
+
+    ###############################################
+    # seed_torch()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_name', type=str,
+                        default='mamba', help='model name')
+
+    parser.add_argument('--epoch', type=int,
+                        default=50, help='epoch number')
+
+    parser.add_argument('--lr', type=float,
+                        default=1e-4, help='learning rate')
+
+    parser.add_argument('--optimizer', type=str,
+                        default='AdamW', help='choosing optimizer AdamW or SGD')
+
+    parser.add_argument('--augmentation',
+                        default=True, help='choose to do random flip rotation')
+
+    parser.add_argument('--batchsize', type=int,
+                        default=8,
+                        help='training batch size')
+
+    parser.add_argument('--img_size', type=int,
+                        default=384, help='training dataset size')
+
+    parser.add_argument('--clip', type=float,
+                        default=0.5, help='gradient clipping margin')
+
+    parser.add_argument('--decay_rate', type=float,
+                        default=0.1, help='decay rate of learning rate')
+
+    parser.add_argument('--decay_epoch', type=int,
+                        default=200, help='every n epochs decay learning rate')
+
+    parser.add_argument('--train_path', type=str,
+                        default='/media/Storage4/zbw/data/polyp/TrainDataset/',
+                        help='path to train dataset')
+
+    parser.add_argument('--test_path', type=str,
+                        default='/media/Storage4/zbw/data/polyp/TestDataset/',
+                        help='path to testing Kvasir dataset')
+
+
+    opt = parser.parse_args()
+
+    train_save = './model_pth/Polyp/'+opt.model_name+'/'
+    logging.basicConfig(filename='./logs/Polyp/train_log_'+opt.model_name+'.log',
+                        format='[%(asctime)s-%(filename)s-%(levelname)s:%(message)s]',
+                        level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S %p')
+    print('batch_size:', str(opt.batchsize))
+    # ---- build models ----
+    #torch.cuda.set_device(2)  # set your gpu device
+
+    from lib.model.mamba import get_mamba
+    from utils.dataloader import get_obj_loader
+    model = get_mamba()
+    model = model.cuda()
+    loss_func = torch.nn.BCEWithLogitsLoss()
+    
+    model = nn.DataParallel(model)
+    best = 0
+    # msg = model.load_state_dict(torch.load('/home/zbw/Polyp/model_pth/mamba2/mamba100.pth'), strict=False)
+    # print(msg)
+    params = model.parameters()
+    if opt.optimizer == 'AdamW':
+        optimizer = torch.optim.AdamW(params, opt.lr, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.SGD(params, opt.lr, weight_decay=1e-4, momentum=0.9)
+
+    print(optimizer)
+    image_root = '{}/images/'.format(opt.train_path)
+    gt_root = '{}/masks/'.format(opt.train_path)
+
+
+
+    eg_root = '{}/edges/'.format(opt.train_path)
+
+    train_loader = get_obj_loader(image_root, gt_root, eg_root, batchsize=opt.batchsize,
+                              trainsize=opt.img_size, num_workers=12)
+   
+    total_step = len(train_loader)
+
+    print("#" * 20, "Start Training", "#" * 20)
+
+    for epoch in range(1, opt.epoch):
+        adjust_lr(optimizer, opt.lr, epoch, opt.decay_rate, opt.decay_epoch)
+        train(train_loader, model, optimizer, epoch, opt.test_path, model_name=opt.model_name)
